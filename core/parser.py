@@ -59,10 +59,3 @@ class CodeParser:
             total_lines=lines,
             raw_code=file_content
         )
-
-def main():
-    obj = CodeParser()      
-    result = obj.parse_file("core/parser.py")  
-    print(result)
-
-main()

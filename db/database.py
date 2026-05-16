@@ -91,11 +91,11 @@ def save_issue(issue_info):
     cursor = conn.cursor()
     try:
         cursor.execute(
-            """INSERT INTO ISSUES (ID,FILE_ID,FILE_NAME,FUNCTION_NAME,LINE_NUMBER,DESCRIPTION,SEVERITY,SUGGESTIONS,STATUS)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            """INSERT INTO ISSUES (FILE_ID,FILE_NAME,FUNCTION_NAME,LINE_NUMBER,DESCRIPTION,SEVERITY,SUGGESTIONS,STATUS)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 issue_info.file_id,
-                issue_info.name,
+                issue_info.file_name,
                 issue_info.function_name,
                 issue_info.line_number,
                 issue_info.description,

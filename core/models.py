@@ -52,19 +52,3 @@ class IssueInfo:
     status: str
 
 
-
-"""
-{
-    "issues": [
-        {
-        function_name: string,
-        line_number: integer,
-        description: string,
-        severity: string,
-        suggestions: string,
-        }
-    ]
-}
-
-
-"""
