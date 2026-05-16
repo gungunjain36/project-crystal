@@ -1,5 +1,7 @@
 import sqlite3
 import json
+from core.models import FunctionInfo, FileInfo, IssueInfo
+
 
 def init_db():
 
@@ -31,6 +33,21 @@ def init_db():
                     CALLS TEXT
             )
             """)
+
+    cursor.execute("""
+            CREATE TABLE IF NOT EXISTS ISSUES(
+                    ID INTEGER PRIMARY KEY AUTOINCREMENT,
+                    FILE_ID INTEGER REFERENCES FILES(ID),
+                    FILE_NAME TEXT,
+                    FUNCTION_NAME TEXT,
+                    LINE_NUMBER INTEGER,
+                    DESCRIPTION TEXT,
+                    SEVERITY TEXT,
+                    SUGGESTIONS TEXT,
+                    STATUS TEXT DEFAULT 'open'
+            )
+            """)
+    
 
     conn.commit()
     conn.close()
@@ -67,3 +84,29 @@ def save_file(file_info):
     finally:
         conn.close()
 
+
+
+def save_issue(issue_info):
+    conn = sqlite3.connect("my_database.db")
+    cursor = conn.cursor()
+    try:
+        cursor.execute(
+            """INSERT INTO ISSUES (ID,FILE_ID,FILE_NAME,FUNCTION_NAME,LINE_NUMBER,DESCRIPTION,SEVERITY,SUGGESTIONS,STATUS)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                issue_info.file_id,
+                issue_info.name,
+                issue_info.function_name,
+                issue_info.line_number,
+                issue_info.description,
+                issue_info.severity,
+                issue_info.suggestions,
+                issue_info.status
+            )
+        )
+        conn.commit()
+    except sqlite3.Error as e:
+        conn.rollback()
+        print(f"Database error: {e}")
+    finally:
+        conn.close()

@@ -2,3 +2,4 @@ langfuse
 anthropic
 python-dotenv
 rich
+pydantic

@@ -1,29 +1,7 @@
 
-from dataclasses import dataclass
 import ast
 from typing import Any
-
-
-@dataclass
-class FunctionInfo:
-    name: str
-    params: list[str]
-    return_type: Any
-    complexity: int
-    calls: list[str]
-    docstring: str
-
-
-@dataclass
-class FileInfo:
-    filepath: str
-    imports: list[str]
-    functions: list[FunctionInfo]
-    classes: list[str]
-    total_lines: int
-    docstring: str
-    raw_code: str
-
+from core.models import FunctionInfo, FileInfo
 class CodeParser:
 
     def parse_file(self, filepath) -> FileInfo:
