@@ -40,8 +40,28 @@ class CodeParser:
         classes = []
 
         for node in tree_walk:
+
+            
             if isinstance(node, ast.FunctionDef):
-                functions.append(node.name)
+
+                params = []
+                param = node.args.args
+                for i in param:
+                    params.append(i.arg)
+
+                complexity = sum(1 for n in ast.walk(node) if isinstance(n, (ast.If, ast.For, ast.While, ast.Try)))
+                calls = [n.func.id for n in ast.walk(node) if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)]
+
+                functions.append(
+                    FunctionInfo(
+                        name=node.name,
+                        params=params,
+                        return_type = ast.unparse(node.returns) if node.returns else None,
+                        complexity= complexity,
+                        calls=calls,
+                        docstring= ast.get_docstring(node)
+                    )
+                )
             elif isinstance(node, ast.Import):
                 for i in node.names:
                     imports.append(i.name)
