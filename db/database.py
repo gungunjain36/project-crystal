@@ -78,6 +78,7 @@ def save_file(file_info):
                 (file_id, func.name, json.dumps(func.params), func.return_type, func.complexity, func.docstring, json.dumps(func.calls))
             )
         conn.commit()
+        return file_id
     except sqlite3.Error as e:
         conn.rollback()
         print(f"Database error: {e}")

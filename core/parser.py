@@ -2,7 +2,17 @@
 import ast
 from typing import Any
 from core.models import FunctionInfo, FileInfo
+from pathlib import Path
+
 class CodeParser:
+
+    def parse_dir(self,dirpath):
+        path_list = Path(dirpath).rglob("*.py")
+        file_info_list = []
+        for path in path_list:
+            file_info_list.append(self.parse_file(path))
+        return file_info_list
+
 
     def parse_file(self, filepath) -> FileInfo:
         with open(filepath, 'r', encoding="utf-8") as file:
@@ -51,7 +61,7 @@ class CodeParser:
         docstring = ast.get_docstring(tree)
         
         return FileInfo(
-            filepath=filepath,
+            filepath=str(filepath),
             imports=imports,
             functions=functions,
             classes=classes,

@@ -4,10 +4,12 @@ from agents.reviewer import review_file
 
 init_db()
 parser = CodeParser()
-file_info = parser.parse_file("core/parser.py")
-save_file(file_info)
+file_infos = parser.parse_dir(".")
 
-issues = review_file(file_info, file_id=1)
-for issue in issues:
-    save_issue(issue)
-    print(issue)
+for file_info in file_infos:
+    file_id = save_file(file_info)
+    issues = review_file(file_info, file_id=file_id)
+    for issue in issues:
+        save_issue(issue)
+        print(issue)
+
