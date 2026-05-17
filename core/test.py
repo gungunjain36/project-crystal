@@ -1,26 +1,11 @@
-# import ast
+from rich.console import Console
+from rich.table import Table
 
-# code = """
-# import os
-# from typing import Any
-# """
+console = Console()
 
-# tree = ast.parse(code)
-# for node in ast.walk(tree):
-#     if isinstance(node, ast.Import):
-#         print(node.names)
+table = Table(title="Test Table")
+table.add_column("Name")
+table.add_column("Value")
+table.add_row("hello", "world")
 
-import ast
-
-code = """
-import os
-from typing import Any
-def my_func(a, b):
-    pass
-class MyClass:
-    pass
-"""
-
-tree = ast.parse(code)
-for node in ast.walk(tree):
-    print(type(node), node.__dict__)
+console.print(table)

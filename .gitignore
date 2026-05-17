@@ -3,3 +3,4 @@ my_database.db
 .env
 __pycache__/
 *.pyc
+.claude
