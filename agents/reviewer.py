@@ -4,8 +4,7 @@ import json
 from core.prompt import SYSTEM_PROMPT
 from dotenv import load_dotenv
 load_dotenv()
-
-
+from tools.schema_tool import tools
 
 def build_user_prompt(file_info: FileInfo) -> str:
     return f"""
@@ -27,10 +26,12 @@ def review_file(file_info: FileInfo, file_id: int) -> list[IssueInfo]:
         model="claude-sonnet-4-6",
         max_tokens=4096,
         system=SYSTEM_PROMPT,
-        messages=[{"role": "user", "content": user_message}]
+        messages=[{"role": "user", "content": user_message}],
+        tools=tools,
+        tool_choice={"type": "tool", "name": "report_issues"}
     )
-    raw_json = response.content[0].text
-    issue_list = IssueList.model_validate_json(raw_json)
+    raw_json = response.content[0].input
+    issue_list = IssueList.model_validate(raw_json)
     
     
     issues = []
