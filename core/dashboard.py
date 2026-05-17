@@ -21,6 +21,7 @@ STATUS_COLORS = {
 def show_dashboard():
     conn = sqlite3.connect("my_database.db")
     cursor = conn.cursor()
+    cursor.execute("PRAGMA foreign_keys = ON")
     cursor.execute("""
         SELECT FILE_NAME, FUNCTION_NAME, LINE_NUMBER, DESCRIPTION, SEVERITY, SUGGESTIONS, STATUS
         FROM ISSUES

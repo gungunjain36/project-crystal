@@ -7,6 +7,7 @@ from dotenv import load_dotenv
 from core.dashboard import show_dashboard
 from rich.progress import Progress, SpinnerColumn, TextColumn
 from rich.console import Console
+from utils.github_integration import create_github_issue
 
 load_dotenv()
 
@@ -37,4 +38,8 @@ with langfuse.start_as_current_observation(as_type="span", name="codesheriff-run
 
 langfuse.flush()
 console.print("[bold green]Review complete![/bold green]")
-show_dashboard()
+# show_dashboard()
+
+for issue in issues:
+    save_issue(issue)
+    create_github_issue(issue)

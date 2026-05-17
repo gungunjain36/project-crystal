@@ -92,6 +92,17 @@ def save_issue(issue_info):
     cursor = conn.cursor()
     try:
         cursor.execute(
+            """SELECT ID FROM ISSUES 
+            WHERE FILE_NAME = ? AND FUNCTION_NAME = ? AND LINE_NUMBER = ? AND SEVERITY = ?""",
+            (issue_info.file_name, issue_info.function_name, issue_info.line_number, issue_info.severity)
+        )
+        existing = cursor.fetchone()
+
+        if existing:
+            return  
+        
+        
+        cursor.execute(
             """INSERT INTO ISSUES (FILE_ID,FILE_NAME,FUNCTION_NAME,LINE_NUMBER,DESCRIPTION,SEVERITY,SUGGESTIONS,STATUS)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
             (
