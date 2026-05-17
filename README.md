@@ -270,5 +270,5 @@ crystal/
 
 - Crystal currently supports Python source files only. Other languages are not parsed.
 - Analysis quality depends on the Claude model's understanding of the codebase context. Large files with many functions may produce less precise line number references.
-- The database schema does not enforce foreign key constraints by default in SQLite; enabling `PRAGMA foreign_keys = ON` is recommended if you extend the schema.
+- The database schema does not enforce foreign key constraints by default in SQLite; 
 - Crystal does not deduplicate issues across runs. Re-running against the same directory will insert duplicate rows.
