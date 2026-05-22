@@ -3,9 +3,11 @@ import ast
 from typing import Any
 from core.models import FunctionInfo, FileInfo
 from pathlib import Path
+from core.base_parser import BaseParser
 
-class CodeParser:
 
+class PythonParser(BaseParser):
+    
     def parse_dir(self,dirpath):
         path_list = Path(dirpath).rglob("*.py")
         file_info_list = []

@@ -1,5 +1,5 @@
 from db.database import init_db, save_file, save_issue
-from core.parser import CodeParser
+from core.language_router import LanguageRouter
 from agents.reviewer import review_file
 from langfuse import get_client
 from opentelemetry.instrumentation.anthropic import AnthropicInstrumentor
@@ -16,7 +16,7 @@ langfuse = get_client()
 console = Console()
 
 init_db()
-parser = CodeParser()
+parser = LanguageRouter()
 
 with langfuse.start_as_current_observation(as_type="span", name="codesheriff-run"):
     file_infos = parser.parse_dir(".")
@@ -34,12 +34,10 @@ with langfuse.start_as_current_observation(as_type="span", name="codesheriff-run
                 issues = review_file(file_info, file_id=file_id)
                 for issue in issues:
                     save_issue(issue)
+                    if issue.severity in ["high", "critical"]:
+                        create_github_issue(issue)
                 progress.remove_task(task)
 
 langfuse.flush()
 console.print("[bold green]Review complete![/bold green]")
 # show_dashboard()
-
-for issue in issues:
-    save_issue(issue)
-    create_github_issue(issue)
