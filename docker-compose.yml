@@ -85,22 +85,21 @@ services:
         condition: service_healthy
       kafka-init:
         condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
     environment:
       KAFKA_BOOTSTRAP_SERVERS: kafka:29092
       KAFKA_TOPIC_SCAN_JOBS: scan-jobs
       KAFKA_TOPIC_SCAN_RESULTS: scan-results
       KAFKA_TOPIC_SCAN_JOBS_DLT: scan-jobs.DLT
       KAFKA_CONSUMER_GROUP: ms-scanner-group
+      DB_URL: postgresql://${DB_USERNAME:-crystal}:${DB_PASSWORD:-crystal}@postgres:5432/${DB_NAME:-crystal_results}
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
       LANGFUSE_PUBLIC_KEY: ${LANGFUSE_PUBLIC_KEY:-}
       LANGFUSE_SECRET_KEY: ${LANGFUSE_SECRET_KEY:-}
       LANGFUSE_HOST: ${LANGFUSE_HOST:-https://cloud.langfuse.com}
       GITHUB_TOKEN: ${GITHUB_TOKEN:-}
       GITHUB_REPO: ${GITHUB_REPO:-}
-      # SQLite stored on named volume — survives container restarts
-      DB_PATH: /app/data/scanner.db
-    volumes:
-      - scanner_db:/app/data
 
   # ─── Microservices ────────────────────────────────────────────────────────
 
@@ -224,7 +223,6 @@ services:
 
 volumes:
   postgres_data:
-  scanner_db:
 
 networks:
   default:

@@ -1,129 +1,143 @@
 import os
-import sqlite3
 import json
-from core.models import FunctionInfo, FileInfo, IssueInfo
+import logging
+import psycopg2
+from psycopg2.extras import execute_values
+from core.models import FileInfo, IssueInfo
 
-# DB_PATH env var lets Docker mount a named volume so data survives restarts.
-# Falls back to a local file for development.
-_DB_PATH = os.getenv("DB_PATH", "scanner.db")
+logger = logging.getLogger(__name__)
+
+_DB_URL = os.getenv(
+    "DB_URL",
+    "postgresql://crystal:crystal@localhost:5432/crystal_results"
+)
+
+
+def _connect():
+    return psycopg2.connect(_DB_URL)
 
 
 def init_db():
-
-    conn = sqlite3.connect(_DB_PATH)
-    cursor = conn.cursor()
-
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS FILES(
-                   ID INTEGER PRIMARY KEY AUTOINCREMENT,
-                   FILEPATH TEXT,
-                   IMPORTS TEXT,
-                   CLASSES TEXT,
-                   LINES INTEGER,
-                   DOCSTRING TEXT,
-                   RAW_CODE TEXT
-        )
-        """)
-
-
-    cursor.execute("""
-            CREATE TABLE IF NOT EXISTS FUNCTIONS(
-                    ID INTEGER PRIMARY KEY AUTOINCREMENT,
-                    FILE_ID INTEGER REFERENCES FILES(ID),
-                    NAME TEXT,
-                    PARAMS TEXT,
-                    RETURN_TYPE TEXT,
-                    COMPLEXITY INTEGER,
-                    DOCSTRING TEXT,
-                    CALLS TEXT
-            )
-            """)
-
-    cursor.execute("""
-            CREATE TABLE IF NOT EXISTS ISSUES(
-                    ID INTEGER PRIMARY KEY AUTOINCREMENT,
-                    FILE_ID INTEGER REFERENCES FILES(ID),
-                    FILE_NAME TEXT,
-                    FUNCTION_NAME TEXT,
-                    LINE_NUMBER INTEGER,
-                    DESCRIPTION TEXT,
-                    SEVERITY TEXT,
-                    SUGGESTIONS TEXT,
-                    STATUS TEXT DEFAULT 'open'
-            )
-            """)
-    
-
-    conn.commit()
-    conn.close()
-
-
-def save_file(file_info):
-    conn = sqlite3.connect(_DB_PATH)
-    cursor = conn.cursor()
+    conn = _connect()
     try:
-        cursor.execute(
-            """INSERT INTO FILES (FILEPATH, IMPORTS, CLASSES, LINES, DOCSTRING, RAW_CODE)
-            VALUES (?, ?, ?, ?, ?, ?)""",
-            (
-                file_info.filepath,
-                json.dumps(file_info.imports),
-                json.dumps(file_info.classes),
-                file_info.total_lines,
-                file_info.docstring,
-                file_info.raw_code
-            )
-        )
-        file_id = cursor.lastrowid
-
-        for func in file_info.functions:
-            cursor.execute(
-                """INSERT INTO FUNCTIONS (FILE_ID, NAME, PARAMS, RETURN_TYPE, COMPLEXITY, DOCSTRING, CALLS)
-                VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                (file_id, func.name, json.dumps(func.params), func.return_type, func.complexity, func.docstring, json.dumps(func.calls))
-            )
-        conn.commit()
-        return file_id
-    except sqlite3.Error as e:
-        conn.rollback()
-        print(f"Database error: {e}")
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS scanner_files (
+                        id         SERIAL PRIMARY KEY,
+                        filepath   TEXT NOT NULL,
+                        imports    JSONB,
+                        classes    JSONB,
+                        lines      INTEGER,
+                        docstring  TEXT,
+                        raw_code   TEXT
+                    )
+                """)
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS scanner_functions (
+                        id          SERIAL PRIMARY KEY,
+                        file_id     INTEGER REFERENCES scanner_files(id) ON DELETE CASCADE,
+                        name        TEXT,
+                        params      JSONB,
+                        return_type TEXT,
+                        complexity  INTEGER,
+                        docstring   TEXT,
+                        calls       JSONB
+                    )
+                """)
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS scanner_issues (
+                        id            SERIAL PRIMARY KEY,
+                        file_id       INTEGER REFERENCES scanner_files(id) ON DELETE CASCADE,
+                        file_name     TEXT,
+                        function_name TEXT,
+                        line_number   INTEGER,
+                        description   TEXT,
+                        severity      TEXT,
+                        suggestions   TEXT,
+                        status        TEXT DEFAULT 'open',
+                        UNIQUE (file_name, function_name, line_number, severity)
+                    )
+                """)
+        logger.info("scanner DB tables initialised")
     finally:
         conn.close()
 
 
-
-def save_issue(issue_info):
-    conn = sqlite3.connect(_DB_PATH)
-    cursor = conn.cursor()
+def save_file(file_info: FileInfo) -> int:
+    conn = _connect()
     try:
-        cursor.execute(
-            """SELECT ID FROM ISSUES 
-            WHERE FILE_NAME = ? AND FUNCTION_NAME = ? AND LINE_NUMBER = ? AND SEVERITY = ?""",
-            (issue_info.file_name, issue_info.function_name, issue_info.line_number, issue_info.severity)
-        )
-        existing = cursor.fetchone()
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """INSERT INTO scanner_files
+                         (filepath, imports, classes, lines, docstring, raw_code)
+                       VALUES (%s, %s, %s, %s, %s, %s)
+                       RETURNING id""",
+                    (
+                        file_info.filepath,
+                        json.dumps(file_info.imports),
+                        json.dumps(file_info.classes),
+                        file_info.total_lines,
+                        file_info.docstring,
+                        file_info.raw_code,
+                    ),
+                )
+                file_id = cur.fetchone()[0]
 
-        if existing:
-            return  
-        
-        
-        cursor.execute(
-            """INSERT INTO ISSUES (FILE_ID,FILE_NAME,FUNCTION_NAME,LINE_NUMBER,DESCRIPTION,SEVERITY,SUGGESTIONS,STATUS)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-            (
-                issue_info.file_id,
-                issue_info.file_name,
-                issue_info.function_name,
-                issue_info.line_number,
-                issue_info.description,
-                issue_info.severity,
-                issue_info.suggestions,
-                issue_info.status
-            )
-        )
-        conn.commit()
-    except sqlite3.Error as e:
-        conn.rollback()
-        print(f"Database error: {e}")
+                if file_info.functions:
+                    execute_values(
+                        cur,
+                        """INSERT INTO scanner_functions
+                             (file_id, name, params, return_type, complexity, docstring, calls)
+                           VALUES %s""",
+                        [
+                            (
+                                file_id,
+                                f.name,
+                                json.dumps(f.params),
+                                f.return_type,
+                                f.complexity,
+                                f.docstring,
+                                json.dumps(f.calls),
+                            )
+                            for f in file_info.functions
+                        ],
+                    )
+        return file_id
+    except psycopg2.Error as e:
+        logger.error("save_file error: %s", e)
+        raise
+    finally:
+        conn.close()
+
+
+def save_issue(issue_info: IssueInfo) -> None:
+    conn = _connect()
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                # ON CONFLICT DO NOTHING enforces the UNIQUE constraint as an idempotent upsert
+                cur.execute(
+                    """INSERT INTO scanner_issues
+                         (file_id, file_name, function_name, line_number,
+                          description, severity, suggestions, status)
+                       VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                       ON CONFLICT (file_name, function_name, line_number, severity)
+                       DO NOTHING""",
+                    (
+                        issue_info.file_id,
+                        issue_info.file_name,
+                        issue_info.function_name,
+                        issue_info.line_number,
+                        issue_info.description,
+                        issue_info.severity,
+                        issue_info.suggestions,
+                        issue_info.status,
+                    ),
+                )
+    except psycopg2.Error as e:
+        logger.error("save_issue error: %s", e)
+        raise
     finally:
         conn.close()
