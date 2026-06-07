@@ -72,6 +72,32 @@ services:
       timeout: 5s
       retries: 5
 
+  # ─── Python Scanner (MS-1) ───────────────────────────────────────────────
+
+  ms-scanner:
+    build:
+      context: .
+      dockerfile: Dockerfile.scanner
+    container_name: crystal-ms-scanner
+    depends_on:
+      kafka:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      KAFKA_TOPIC_SCAN_JOBS: scan-jobs
+      KAFKA_TOPIC_SCAN_RESULTS: scan-results
+      KAFKA_CONSUMER_GROUP: ms-scanner-group
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+      LANGFUSE_PUBLIC_KEY: ${LANGFUSE_PUBLIC_KEY:-}
+      LANGFUSE_SECRET_KEY: ${LANGFUSE_SECRET_KEY:-}
+      LANGFUSE_HOST: ${LANGFUSE_HOST:-https://cloud.langfuse.com}
+      GITHUB_TOKEN: ${GITHUB_TOKEN:-}
+      GITHUB_REPO: ${GITHUB_REPO:-}
+    volumes:
+      - scanner_db:/app/data
+
   # ─── Microservices ────────────────────────────────────────────────────────
 
   ms-intake:
@@ -149,6 +175,7 @@ services:
 
 volumes:
   postgres_data:
+  scanner_db:
 
 networks:
   default:
