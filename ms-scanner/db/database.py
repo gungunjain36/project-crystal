@@ -47,21 +47,46 @@ def init_db():
                 """)
                 cur.execute("""
                     CREATE TABLE IF NOT EXISTS scanner_issues (
-                        id            SERIAL PRIMARY KEY,
-                        file_id       INTEGER REFERENCES scanner_files(id) ON DELETE CASCADE,
-                        file_name     TEXT,
-                        function_name TEXT,
-                        line_number   INTEGER,
-                        description   TEXT,
-                        severity      TEXT,
-                        suggestions   TEXT,
-                        status        TEXT DEFAULT 'open',
-                        UNIQUE (file_name, function_name, line_number, severity)
+                        id                 SERIAL PRIMARY KEY,
+                        file_id            INTEGER REFERENCES scanner_files(id) ON DELETE CASCADE,
+                        file_name          TEXT,
+                        function_name      TEXT,
+                        line_number        INTEGER,
+                        title              TEXT,
+                        description        TEXT,
+                        severity           TEXT,
+                        confidence         TEXT DEFAULT 'medium',
+                        cwe_id             TEXT DEFAULT '',
+                        owasp_category     TEXT DEFAULT '',
+                        affected_snippet   TEXT DEFAULT '',
+                        suggestions        TEXT,
+                        remediation_example TEXT DEFAULT '',
+                        status             TEXT DEFAULT 'open',
+                        source             TEXT DEFAULT 'claude',
+                        UNIQUE (file_name, function_name, line_number, severity, source)
                     )
                 """)
+                # Idempotent migrations — add new columns if they don't exist yet
+                _add_column_if_missing(cur, "scanner_issues", "title",               "TEXT DEFAULT ''")
+                _add_column_if_missing(cur, "scanner_issues", "confidence",          "TEXT DEFAULT 'medium'")
+                _add_column_if_missing(cur, "scanner_issues", "cwe_id",              "TEXT DEFAULT ''")
+                _add_column_if_missing(cur, "scanner_issues", "owasp_category",      "TEXT DEFAULT ''")
+                _add_column_if_missing(cur, "scanner_issues", "affected_snippet",    "TEXT DEFAULT ''")
+                _add_column_if_missing(cur, "scanner_issues", "remediation_example", "TEXT DEFAULT ''")
+                _add_column_if_missing(cur, "scanner_issues", "source",              "TEXT DEFAULT 'claude'")
         logger.info("scanner DB tables initialised")
     finally:
         conn.close()
+
+
+def _add_column_if_missing(cur, table: str, column: str, definition: str) -> None:
+    cur.execute(
+        "SELECT 1 FROM information_schema.columns WHERE table_name=%s AND column_name=%s",
+        (table, column),
+    )
+    if cur.fetchone() is None:
+        cur.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+        logger.info("Migration: added column %s.%s", table, column)
 
 
 def save_file(file_info: FileInfo) -> int:
@@ -117,23 +142,36 @@ def save_issue(issue_info: IssueInfo) -> None:
     try:
         with conn:
             with conn.cursor() as cur:
-                # ON CONFLICT DO NOTHING enforces the UNIQUE constraint as an idempotent upsert
                 cur.execute(
-                    """INSERT INTO scanner_issues
-                         (file_id, file_name, function_name, line_number,
-                          description, severity, suggestions, status)
-                       VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-                       ON CONFLICT (file_name, function_name, line_number, severity)
+                    """INSERT INTO scanner_issues (
+                         file_id, file_name, function_name, line_number,
+                         title, description, severity, confidence,
+                         cwe_id, owasp_category, affected_snippet,
+                         suggestions, remediation_example, status, source
+                       ) VALUES (
+                         %s, %s, %s, %s,
+                         %s, %s, %s, %s,
+                         %s, %s, %s,
+                         %s, %s, %s, %s
+                       )
+                       ON CONFLICT (file_name, function_name, line_number, severity, source)
                        DO NOTHING""",
                     (
                         issue_info.file_id,
                         issue_info.file_name,
                         issue_info.function_name,
                         issue_info.line_number,
+                        issue_info.title,
                         issue_info.description,
                         issue_info.severity,
+                        issue_info.confidence,
+                        issue_info.cwe_id,
+                        issue_info.owasp_category,
+                        issue_info.affected_snippet,
                         issue_info.suggestions,
+                        issue_info.remediation_example,
                         issue_info.status,
+                        issue_info.source,
                     ),
                 )
     except psycopg2.Error as e:

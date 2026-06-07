@@ -8,6 +8,8 @@ load_dotenv()
 
 from db.database import init_db, save_file, save_issue
 from core.language_router import LanguageRouter
+from core.secret_detector import scan_for_secrets
+from core.dependency_scanner import scan_dependencies
 from agents.reviewer import review_file
 from kafka.consumer import ScanJobConsumer
 from kafka.producer import ScanResultProducer
@@ -34,10 +36,17 @@ def _clone_github_repo(url: str, dest: str) -> None:
 
 
 def _scan_target(job_id: str, target_type: str, target: str) -> list[dict]:
-    """Run the full scan pipeline for one job. Returns list of issue dicts for Kafka."""
+    """
+    Full scan pipeline for one job.
+    Runs three passes in order:
+      1. Dependency scanner — checks requirements.txt for known-vulnerable packages
+      2. Secret detector — regex pass for hardcoded credentials on every file
+      3. Claude AI review — deep semantic analysis per file
+    Returns issue list for Kafka.
+    """
     scan_dir = None
     cleanup = False
-    issues_for_kafka = []
+    issues_for_kafka: list[dict] = []
 
     try:
         if target_type == "github_url":
@@ -49,31 +58,66 @@ def _scan_target(job_id: str, target_type: str, target: str) -> list[dict]:
             scan_dir = target
 
         with langfuse.start_as_current_observation(as_type="span", name=f"scan-job-{job_id}"):
+
+            # ── Pass 1: dependency scan ────────────────────────────────────
+            with langfuse.start_as_current_observation(as_type="span", name="dependency-scan"):
+                dep_issues = scan_dependencies(scan_dir)
+                for issue in dep_issues:
+                    save_issue(issue)
+                    issues_for_kafka.append(_issue_to_kafka_dict(issue))
+                console.print(f"[yellow]Job {job_id}: {len(dep_issues)} dependency finding(s)[/yellow]")
+
+            # ── Pass 2 + 3: per-file secret detection + Claude review ──────
             file_infos = parser.parse_dir(scan_dir)
-            console.print(f"[bold cyan]Job {job_id}: {len(file_infos)} files to review[/bold cyan]")
+            console.print(f"[bold cyan]Job {job_id}: {len(file_infos)} files queued for review[/bold cyan]")
 
             for file_info in file_infos:
-                with langfuse.start_as_current_observation(as_type="span", name=f"review-{file_info.filepath}"):
+                with langfuse.start_as_current_observation(
+                    as_type="span", name=f"review-{file_info.filepath}"
+                ):
                     file_id = save_file(file_info)
-                    found = review_file(file_info, file_id=file_id)
-                    for issue in found:
+
+                    # Secret detection — deterministic, runs first
+                    secret_issues = scan_for_secrets(file_info.filepath, file_id)
+                    for issue in secret_issues:
                         save_issue(issue)
-                        if issue.severity in ["high", "critical"]:
+                        issues_for_kafka.append(_issue_to_kafka_dict(issue))
+
+                    # Claude AI deep analysis
+                    claude_issues = review_file(file_info, file_id=file_id)
+                    for issue in claude_issues:
+                        save_issue(issue)
+                        if issue.severity in ("high", "critical"):
                             create_github_issue(issue)
-                        issues_for_kafka.append({
-                            "severity": issue.severity,
-                            "type": issue.function_name,
-                            "location": f"{issue.file_name}:{issue.line_number}",
-                            "description": issue.description,
-                        })
+                        issues_for_kafka.append(_issue_to_kafka_dict(issue))
 
         langfuse.flush()
-        console.print(f"[bold green]Job {job_id}: done — {len(issues_for_kafka)} issues[/bold green]")
+
+        total = len(issues_for_kafka)
+        critical = sum(1 for i in issues_for_kafka if i["severity"] == "critical")
+        high = sum(1 for i in issues_for_kafka if i["severity"] == "high")
+        console.print(
+            f"[bold green]Job {job_id}: done — "
+            f"{total} total issues ({critical} critical, {high} high)[/bold green]"
+        )
         return issues_for_kafka
 
     finally:
         if cleanup and scan_dir:
             shutil.rmtree(scan_dir, ignore_errors=True)
+
+
+def _issue_to_kafka_dict(issue) -> dict:
+    return {
+        "severity": issue.severity,
+        "type": issue.title or issue.function_name,
+        "location": f"{issue.file_name}:{issue.line_number}",
+        "description": issue.description,
+        "cweId": issue.cwe_id,
+        "owaspCategory": issue.owasp_category,
+        "confidence": issue.confidence,
+        "source": issue.source,
+    }
 
 
 def run_service() -> None:
