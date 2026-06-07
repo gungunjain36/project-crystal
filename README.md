@@ -1,274 +1,566 @@
 # Crystal
 
-Crystal is a static security analysis tool for Python codebases. It parses source files using the Abstract Syntax Tree (AST), sends the extracted code structure and raw content to Claude AI for vulnerability detection, and persists all findings to a local SQLite database. Execution is traced end-to-end through Langfuse for observability and debugging.
+Crystal is a cloud-native static security analysis platform. It scans source code repositories for vulnerabilities using AST parsing and Claude AI, and exposes the full pipeline as event-driven microservices. This document covers the full system design, architectural decisions, and deployment guide.
 
 ---
 
-## Overview
+## Table of Contents
 
-Crystal automates the process of security code review. Given a directory of Python files, it:
-
-1. Walks the directory recursively and parses every `.py` file with the Python AST module, extracting functions, classes, imports, docstrings, complexity metrics, and raw source code.
-2. Sends each parsed file to a Claude-powered review agent that acts as a cybersecurity expert. Claude is forced to respond through a structured tool (`report_issues`) so output is always machine-readable.
-3. Stores all results — files, functions, and issues — in a local SQLite database (`my_database.db`).
-4. Wraps every operation in Langfuse spans so you can inspect latency, token usage, and model behavior after each run.
-
-Crystal does not execute code. All analysis is static and performed purely on AST output and raw source text.
+- [How We Built This](#how-we-built-this)
+- [System Architecture](#system-architecture)
+- [Services](#services)
+- [Data Flow](#data-flow)
+- [Kafka Message Schemas](#kafka-message-schemas)
+- [API Gateway & Auth](#api-gateway--auth)
+- [System Design Decisions](#system-design-decisions)
+- [Known Gaps & Next Steps](#known-gaps--next-steps)
+- [Running Locally](#running-locally)
+- [Deploying to AWS](#deploying-to-aws)
+- [Repo Structure](#repo-structure)
 
 ---
 
-## Architecture
+## How We Built This
+
+Crystal started as a single Python script: walk a directory, parse Python files with AST, send each file to Claude for security review, write findings to SQLite. That was MS-1 — simple, useful, but not scalable and not usable by external clients.
+
+The platform has since grown into a full product: a web client where users configure GitHub repositories and trigger scans, backed by an event-driven microservices pipeline.
+
+**The problem with the single-service model:**
+- Scanning is slow (LLM calls per file). A synchronous REST API would time out.
+- Results storage, querying, and alerting were all tangled together in one script.
+- No way to scale the scanner independently of the API layer.
+
+**The solution: event-driven microservices over Kafka.**
+
+We decomposed the pipeline into four services with clear contracts, connected by two Kafka topics. Each service can be scaled, deployed, and debugged independently.
+
+**Technology choices:**
+- **Kafka** over a message queue (SQS, RabbitMQ): partitioned, replayable, multiple independent consumers on the same topic. Both ms-results and ms-alert consume from `scan-results` without knowing about each other.
+- **Spring Boot** for the Java services: battle-tested ecosystem for Kafka, JPA, REST, and Swagger out of the box.
+- **Python for the scanner**: the existing scanner logic (AST parsing, Claude integration, Langfuse tracing) was already Python. Rewriting it in Java would have been pure churn.
+- **Spring Cloud Gateway** as the API gateway: reactive, integrates natively with the Spring ecosystem, handles routing, rate limiting, and auth in one place.
+- **PostgreSQL** for results persistence (ms-results): structured queries, supports pagination and severity stats natively.
+- **SQLite** for the scanner's internal state: the scanner's own file/function metadata is append-only and local to each scan run. Not shared state — no coordination required.
+
+---
+
+## System Architecture
 
 ```
-Directory of .py files
-        |
-        v
-  [core/parser.py]          AST-based extraction
-  Produces FileInfo objects  (imports, functions, classes, raw code, line counts)
-        |
-        v
-  [db/database.py]          Persists file + function metadata to SQLite
-        |
-        v
-  [agents/reviewer.py]      Calls Claude Sonnet with security system prompt
-  Uses report_issues tool    Forces structured JSON output
-        |
-        v
-  [db/database.py]          Persists issues to SQLite
-        |
-        v
-  [Langfuse]                Traces entire run for observability
+    ┌──────────────────────────────────┐
+    │        client :3000              │
+    │   React 18 + Vite + Tailwind     │
+    │  - Configure GitHub repos        │
+    │  - Trigger scans one-click       │
+    │  - Live polling for results      │
+    │  - Severity breakdown UI         │
+    └────────────────┬─────────────────┘
+                     │  HTTP (all API calls)
+                     ▼
+    ┌──────────────────────────────────┐
+    │        ms-gateway :8080          │
+    │     Spring Cloud Gateway         │
+    │  - X-API-Key validation          │
+    │  - Rate limiting 20 req/s per IP │
+    │  - CORS                          │
+    │  - /health/services aggregation  │
+    └────────────────┬─────────────────┘
+                     │
+      ┌──────────────┼──────────────────┐
+      │              │                  │
+      ▼              ▼                  ▼
+ /api/v1/scans  /api/v1/results  /api/v1/alerts
+      │
+      ▼
+    ┌─────────────────────┐
+    │   ms-intake :8081   │
+    │   Spring Boot REST  │
+    │  Validates request  │
+    │  Generates job UUID │
+    └────────┬────────────┘
+             │  Kafka: scan-jobs
+             ▼
+    ┌─────────────────────┐
+    │  ms-scanner         │
+    │  Python 3.11        │
+    │  AST parsing        │
+    │  Claude AI review   │
+    │  GitHub issues      │
+    │  Langfuse traces    │
+    └────┬────────────┬───┘
+         │            │
+         │  scan-results   scan-jobs.DLT (on failure)
+         ▼            ▼
+    ┌────────────┐  ┌───────────────────┐
+    │ ms-results │  │    ms-alert       │
+    │ :8082      │  │    :8083          │
+    │ PostgreSQL │  │ Slack webhook     │
+    │ REST API   │  │ high/critical only│
+    └────────────┘  └───────────────────┘
+
+Infrastructure:
+  Kafka + Zookeeper  — async message transport (3 topics)
+  PostgreSQL         — shared DB for ms-results + ms-scanner internal tables
 ```
 
-### Component breakdown
+---
 
-| Component | File | Responsibility |
+## Services
+
+| Service | Stack | Port | Responsibility |
+|---|---|---|---|
+| [client](./client/README.md) | React 18 + Vite + Tailwind | 3000 | Web UI — configure repos, trigger scans, view results with live polling. |
+| [ms-gateway](./ms-gateway/README.md) | Spring Cloud Gateway | 8080 | Single public entry point. Auth, rate limiting, CORS, health aggregation. |
+| [ms-intake](./ms-intake/README.md) | Spring Boot 3.5 | 8081 | Accepts scan requests, validates, produces to `scan-jobs`. |
+| [ms-scanner](./ms-scanner/README.md) | Python 3.11 | — | Consumes `scan-jobs`, runs Claude analysis, produces to `scan-results`. |
+| [ms-results](./ms-results/README.md) | Spring Boot 3.5 | 8082 | Consumes `scan-results`, persists to PostgreSQL, REST query API. |
+| [ms-alert](./ms-alert/README.md) | Spring Boot 3.5 | 8083 | Consumes `scan-results`, sends Slack webhook for high/critical findings. |
+
+---
+
+## Data Flow
+
+```
+1. Client → POST /api/v1/scans (X-API-Key: <key>)
+   Body: { targetType, target, requestedBy }
+
+2. ms-gateway validates API key, rate checks, routes to ms-intake
+
+3. ms-intake:
+   - Validates request body
+   - Generates jobId (UUID)
+   - Publishes to Kafka topic: scan-jobs
+   - Returns 202 Accepted { jobId, status: "accepted" }
+
+4. ms-scanner (async, may take seconds to minutes):
+   - Consumes scan-jobs message
+   - If targetType=github_url: clones repo to tmp dir
+   - Walks source files, extracts AST (imports, functions, complexity)
+   - For each file: calls Claude claude-sonnet-4-6 with security prompt
+   - Claude returns structured issues via report_issues tool
+   - Saves findings to SQLite (internal audit log)
+   - Creates GitHub issues for high/critical findings
+   - Publishes to Kafka topic: scan-results
+
+5a. ms-results (async):
+    - Consumes scan-results message
+    - Persists ScanResult + ScanIssue entities to PostgreSQL
+    - Client can poll GET /api/v1/results/{jobId} for findings
+
+5b. ms-alert (async, parallel to 5a):
+    - Consumes same scan-results message (separate consumer group)
+    - Filters issues with severity = high or critical
+    - POSTs Slack webhook with attachment per finding
+```
+
+---
+
+## Kafka Message Schemas
+
+**Topic: `scan-jobs`** (produced by ms-intake, consumed by ms-scanner)
+```json
+{
+  "jobId": "550e8400-e29b-41d4-a716-446655440000",
+  "requestedAt": "2024-01-15T10:30:00Z",
+  "targetType": "file | github_url",
+  "target": "/path/to/code OR https://github.com/owner/repo",
+  "requestedBy": "username"
+}
+```
+
+**Topic: `scan-results`** (produced by ms-scanner, consumed by ms-results AND ms-alert)
+```json
+{
+  "jobId": "550e8400-e29b-41d4-a716-446655440000",
+  "completedAt": "2024-01-15T10:31:45Z",
+  "status": "success | failure",
+  "issues": [
+    {
+      "severity": "low | medium | high | critical",
+      "type": "function_name_or_pattern",
+      "location": "path/to/file.py:42",
+      "description": "SQL injection via unsanitised input in execute() call"
+    }
+  ]
+}
+```
+
+---
+
+## API Gateway & Auth
+
+**Why a gateway:** Without it, every client must know each service's host and port. In production (ECS, EKS) services live behind private networking — only the gateway is public-facing. It also means auth, rate limiting, and CORS live in one place rather than being duplicated across four services.
+
+**Current auth: API key (`X-API-Key` header)**
+The gateway validates the key before forwarding any request. All downstream services also validate it as a second line of defence (defence in depth). The key is shared via `API_KEY` environment variable.
+
+**Why not a dedicated auth microservice yet:**
+A separate auth service (issuing JWTs, managing users, OAuth flows) adds significant operational complexity: its own database, token refresh logic, key rotation, availability requirements. The right time to add it is when you have multiple client types (web app, CLI, CI integration), or when you need user accounts with different permission levels. For API-to-API communication with a known set of clients, a shared secret or JWT validated at the gateway is sufficient.
+
+**Natural upgrade path:**
+```
+Current:  X-API-Key → gateway validates static secret
+Next:     X-API-Key → AWS API Gateway + Cognito authoriser (managed)
+Later:    JWT (RS256) → gateway validates with JWKS, no auth service needed
+Full:     Dedicated auth service (Keycloak / custom) → user management, OAuth, RBAC
+```
+
+---
+
+## System Design Decisions
+
+### Why Kafka over direct HTTP between scanner and results?
+
+Scanning is slow — each file requires a Claude API call. A synchronous chain (intake → scanner → results) would hold the HTTP connection open for minutes. Kafka decouples request acceptance (< 50ms) from processing (seconds to minutes). The client gets an immediate `jobId` and polls for results.
+
+### Why two consumer groups on scan-results?
+
+ms-results and ms-alert both consume from `scan-results` but do completely different things. Independent consumer groups mean:
+- Each service maintains its own offset — they can't block each other.
+- If ms-alert is down, ms-results keeps consuming unaffected.
+- You can add more consumers (e.g. ms-metrics, ms-webhook) without touching existing services.
+
+### Why PostgreSQL for ms-results but SQLite for ms-scanner?
+
+ms-results needs to serve concurrent read queries with pagination, filtering, and aggregation — PostgreSQL handles this natively. The scanner's SQLite is an internal audit log (file paths, function graphs, raw code) used only by that one process. It never needs to be queried by anything else. Using a shared database for this would couple services unnecessarily.
+
+### Why Spring Cloud Gateway over AWS API Gateway?
+
+For local development and self-hosted deployments, a code-managed gateway is simpler. On AWS, you'd put AWS API Gateway in front of the ALB and optionally keep the Spring Cloud Gateway for internal routing. The two are complementary, not competing.
+
+---
+
+## Known Gaps & Next Steps
+
+These are real production gaps to address before a serious deployment:
+
+| Gap | Status | Notes |
 |---|---|---|
-| Entry point | `main.py` | Orchestrates the full pipeline |
-| Parser | `core/parser.py` | AST extraction from Python source files |
-| Data models | `core/models.py` | Pydantic schemas for all domain objects |
-| System prompt | `core/prompt.py` | Chain-of-thought security analysis instructions for Claude |
-| Review agent | `agents/reviewer.py` | Manages Claude API calls and parses tool output |
-| Tool schema | `tools/schema_tool.py` | Defines the `report_issues` structured output tool |
-| Database | `db/database.py` | SQLite CRUD operations |
+| No dead-letter topic | **Fixed** | `scan-jobs.DLT` topic created; scanner publishes failed jobs there with full stack trace |
+| ms-scanner SQLite not persistent | **Fixed** | Migrated to PostgreSQL (`scanner_files`, `scanner_functions`, `scanner_issues` tables in shared DB) |
+| No rate limiting | **Fixed** | ms-gateway: Guava RateLimiter per IP, 20 req/s with burst 40, returns 429 |
+| No API gateway | **Fixed** | ms-gateway (Spring Cloud Gateway) on :8080 — auth, rate limiting, CORS, health aggregation |
+| No web client | **Fixed** | React client on :3000 — repo management, one-click scans, live result polling |
+| Static API key auth | **Remaining** | Upgrade path: JWT (RS256) validated at gateway → Cognito/Keycloak for full OAuth |
+| No circuit breaker | **Remaining** | Add Resilience4j circuit breaker to ms-gateway routes — prevents cascade failures |
+| ms-scanner not horizontally scalable | **Partial** | Consumer group configured, but Kafka partition count (3) limits parallelism — increase for production |
+| No job status endpoint | **Remaining** | Client polls `GET /results/{jobId}` which returns 404 until scan completes — add a `status: pending/scanning` intermediate state |
+| Slack-only alerting | **Remaining** | ms-alert webhook fanout (PagerDuty, email, Teams) can be added as strategy pattern |
 
 ---
 
-## Data Models
-
-### FileInfo
-Produced by the parser for each source file.
-
-| Field | Type | Description |
-|---|---|---|
-| `filepath` | str | Absolute path to the file |
-| `imports` | list[str] | All imported module names |
-| `functions` | list[FunctionInfo] | Parsed function definitions |
-| `classes` | list[str] | Class names defined in the file |
-| `total_lines` | int | Total line count |
-| `raw_code` | str | Full source text |
-
-### FunctionInfo
-Extracted per function within a file.
-
-| Field | Type | Description |
-|---|---|---|
-| `name` | str | Function name |
-| `params` | list[str] | Parameter names |
-| `return_type` | str or None | Annotated return type |
-| `complexity` | int | Count of branching statements (if/for/while/try) |
-| `calls` | list[str] | Functions called within the body |
-| `docstring` | str or None | Docstring content |
-
-### Issue
-A single security finding reported by Claude.
-
-| Field | Type | Description |
-|---|---|---|
-| `function_name` | str | Function where the issue was found |
-| `line_number` | int | Approximate line number |
-| `description` | str | Plain-language explanation of the vulnerability |
-| `severity` | Severity | One of: `low`, `medium`, `high`, `critical` |
-| `suggestions` | list[str] | Actionable remediation steps |
-
-### IssueInfo
-Issue extended with file context for database storage — combines `Issue` fields with `FileInfo.filepath`.
-
----
-
-## Database Schema
-
-Crystal writes to a local SQLite database at `my_database.db`. The schema consists of three tables.
-
-### FILES
-Stores one row per analyzed source file.
-
-```
-FILEPATH    TEXT (primary key)
-IMPORTS     TEXT (comma-separated)
-CLASSES     TEXT (comma-separated)
-LINES       INTEGER
-DOCSTRING   TEXT
-RAW_CODE    TEXT
-```
-
-### FUNCTIONS
-Stores one row per function, linked to its parent file.
-
-```
-FILE_ID         TEXT (foreign key -> FILES.FILEPATH)
-NAME            TEXT
-PARAMS          TEXT (comma-separated)
-RETURN_TYPE     TEXT
-COMPLEXITY      INTEGER
-DOCSTRING       TEXT
-CALLS           TEXT (comma-separated)
-```
-
-### ISSUES
-Stores one row per security finding.
-
-```
-FILE_ID         TEXT (foreign key -> FILES.FILEPATH)
-FUNCTION_NAME   TEXT
-LINE_NUMBER     INTEGER
-DESCRIPTION     TEXT
-SEVERITY        TEXT
-SUGGESTIONS     TEXT (newline-separated)
-STATUS          TEXT
-```
-
----
-
-## Review Agent
-
-The review agent (`agents/reviewer.py`) is the core of Crystal. For each file it:
-
-1. Constructs a user message containing the parsed file structure (imports, functions, complexity) and the full raw source code.
-2. Calls `claude-sonnet-4-6` with the cybersecurity system prompt from `core/prompt.py` and the `report_issues` tool from `tools/schema_tool.py`.
-3. Claude reasons through the code using chain-of-thought, then calls `report_issues` with a JSON array of findings.
-4. The agent deserializes the tool input and returns a list of `IssueInfo` objects.
-
-The system prompt instructs Claude to:
-- Understand the file structure and function relationships before reporting.
-- Identify vulnerabilities, insecure patterns, and exploitable code paths.
-- Report exact locations with severity classifications and concrete remediation suggestions.
-- Use the `report_issues` tool exclusively for output so results are always structured.
-
-Severity levels follow a four-tier scale: `low`, `medium`, `high`, `critical`.
-
----
-
-## Observability
-
-Crystal integrates Langfuse for full-run tracing. Every analysis run is wrapped in a Langfuse trace, and each file review is wrapped in a child span. After the run completes, the client flushes all pending events to Langfuse.
-
-This lets you inspect:
-- Total tokens consumed per file and per run.
-- Claude latency per file.
-- Model inputs and outputs (the exact prompt sent and tool response received).
-- Which files produced the most findings.
-
----
-
-## Setup
+## Running Locally
 
 ### Prerequisites
-
-- Python 3.9 or later
+- Docker and Docker Compose
 - An Anthropic API key
-- A Langfuse account (cloud or self-hosted)
 
-### Installation
+### Setup
+
+1. Create `.env` at the repo root:
+
+```env
+# Required
+ANTHROPIC_API_KEY=sk-ant-...
+
+# Shared API key for all REST services
+API_KEY=dev-secret-key
+
+# Optional — Slack alerts
+SLACK_WEBHOOK_URL=https://hooks.slack.com/services/...
+
+# Optional — GitHub issue creation from scanner
+GITHUB_TOKEN=ghp_...
+GITHUB_REPO=owner/repo
+
+# Optional — Langfuse observability
+LANGFUSE_PUBLIC_KEY=pk-lf-...
+LANGFUSE_SECRET_KEY=sk-lf-...
+LANGFUSE_HOST=https://cloud.langfuse.com
+
+# PostgreSQL (defaults work with docker-compose)
+DB_NAME=crystal_results
+DB_USERNAME=crystal
+DB_PASSWORD=crystal
+```
+
+2. Start the full stack:
 
 ```bash
-git clone <repository-url>
-cd codeview
-pip install -r requirements.txt
+docker-compose up --build
 ```
 
-### Environment variables
+3. Open the web client at **http://localhost:3000**
+   - Add a GitHub repo URL in the dashboard
+   - Click "Run Scan" — the job is submitted through the gateway
+   - Results appear automatically as the scanner finishes (live polling)
 
-Create a `.env` file in the project root with the following keys:
-
-```
-ANTHROPIC_API_KEY=your_anthropic_api_key
-LANGFUSE_SECRET_KEY=your_langfuse_secret_key
-LANGFUSE_PUBLIC_KEY=your_langfuse_public_key
-LANGFUSE_BASE_URL=https://cloud.langfuse.com
-```
-
-Adjust `LANGFUSE_BASE_URL` if you are using a self-hosted or regional Langfuse instance.
-
----
-
-## Usage
-
-Run Crystal against the current directory:
+### Triggering a scan via API
 
 ```bash
-python main.py
+# Scan a GitHub repository
+curl -X POST http://localhost:8080/api/v1/scans \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: dev-secret-key" \
+  -d '{
+    "targetType": "github_url",
+    "target": "https://github.com/owner/repo",
+    "requestedBy": "your-name"
+  }'
+# Response: { "jobId": "...", "status": "accepted" }
+
+# Poll for results
+curl http://localhost:8080/api/v1/results/{jobId} \
+  -H "X-API-Key: dev-secret-key"
+
+# Severity breakdown
+curl http://localhost:8080/api/v1/results/stats/severity \
+  -H "X-API-Key: dev-secret-key"
 ```
 
-Crystal will:
-1. Initialize the database (creates `my_database.db` if it does not exist).
-2. Parse all `.py` files found recursively from the current directory.
-3. Review each file with Claude and print findings to stdout.
-4. Write all results to the database.
-5. Flush observability data to Langfuse.
+All traffic goes through the gateway on port **8080**. Direct service ports (8081–8083) are for internal/debugging only.
 
-To scan a different directory, modify the `parse_dir` call in `main.py` to point to your target path.
+### Swagger UI
 
----
-
-## Dependencies
-
-| Package | Purpose |
+| Service | URL |
 |---|---|
-| `anthropic` | Claude API client |
-| `langfuse` | Observability and tracing |
-| `opentelemetry-instrumentation-anthropic` | OTel instrumentation for Anthropic calls |
-| `pydantic` | Data validation and model definitions |
-| `python-dotenv` | Loading `.env` into environment |
-| `rich` | Terminal output formatting |
+| ms-intake | http://localhost:8081/swagger-ui.html |
+| ms-results | http://localhost:8082/swagger-ui.html |
+| ms-alert | http://localhost:8083/swagger-ui.html |
 
-Install all dependencies with:
+---
+
+## Deploying to AWS
+
+### Architecture on AWS
+
+```
+Internet
+   │
+   ▼
+Route 53 (DNS)
+   │
+   ▼
+ACM Certificate (SSL termination)
+   │
+   ▼
+Application Load Balancer (ALB)
+   │  Listener: HTTPS :443 → Target Group: ms-gateway ECS tasks
+   ▼
+ECS Fargate Cluster
+   ├── ms-gateway     (1–3 tasks, public subnet, port 8080)
+   ├── ms-intake      (1–N tasks, private subnet, port 8081)
+   ├── ms-results     (1–N tasks, private subnet, port 8082)
+   ├── ms-alert       (1–N tasks, private subnet, port 8083)
+   └── ms-scanner     (1–N tasks, private subnet)
+         │
+         └── EFS mount for SQLite persistence
+Infrastructure:
+   Amazon MSK        — managed Kafka (replaces local Kafka + Zookeeper)
+   Amazon RDS        — managed PostgreSQL (replaces local Postgres container)
+   Amazon ECR        — container registry
+   AWS Secrets Manager — all env vars and secrets
+   Amazon CloudWatch — logs, metrics, alarms
+   Amazon EFS        — persistent volume for ms-scanner SQLite
+```
+
+### Step-by-step deployment
+
+#### 1. Push images to ECR
 
 ```bash
-pip install -r requirements.txt
+# Authenticate
+aws ecr get-login-password --region ap-south-1 | \
+  docker login --username AWS --password-stdin <account-id>.dkr.ecr.ap-south-1.amazonaws.com
+
+# Create repos (once)
+for svc in ms-gateway ms-intake ms-results ms-alert ms-scanner; do
+  aws ecr create-repository --repository-name crystal/$svc --region ap-south-1
+done
+
+# Build and push each service
+for svc in ms-gateway ms-intake ms-results ms-alert; do
+  docker build -t crystal/$svc ./$svc
+  docker tag crystal/$svc <account-id>.dkr.ecr.ap-south-1.amazonaws.com/crystal/$svc:latest
+  docker push <account-id>.dkr.ecr.ap-south-1.amazonaws.com/crystal/$svc:latest
+done
+
+# Scanner (Python)
+docker build -t crystal/ms-scanner ./ms-scanner
+docker tag crystal/ms-scanner <account-id>.dkr.ecr.ap-south-1.amazonaws.com/crystal/ms-scanner:latest
+docker push <account-id>.dkr.ecr.ap-south-1.amazonaws.com/crystal/ms-scanner:latest
 ```
+
+#### 2. Provision infrastructure
+
+**MSK (Kafka):**
+```bash
+# Create MSK cluster (2 brokers, kafka.t3.small for dev)
+aws kafka create-cluster \
+  --cluster-name crystal-kafka \
+  --kafka-version 3.5.1 \
+  --number-of-broker-nodes 2 \
+  --broker-node-group-info \
+    InstanceType=kafka.t3.small,ClientSubnets=[subnet-xxx,subnet-yyy],SecurityGroups=[sg-xxx]
+
+# After creation, get bootstrap servers
+aws kafka get-bootstrap-brokers --cluster-arn <arn>
+# Use the PLAINTEXT endpoint value as KAFKA_BOOTSTRAP_SERVERS
+```
+
+**RDS PostgreSQL:**
+```bash
+aws rds create-db-instance \
+  --db-instance-identifier crystal-postgres \
+  --db-instance-class db.t3.micro \
+  --engine postgres \
+  --engine-version 16 \
+  --master-username crystal \
+  --master-user-password <password> \
+  --db-name crystal_results \
+  --vpc-security-group-ids sg-xxx \
+  --db-subnet-group-name <subnet-group>
+```
+
+#### 3. Store secrets in AWS Secrets Manager
+
+```bash
+aws secretsmanager create-secret --name crystal/production \
+  --secret-string '{
+    "API_KEY": "...",
+    "ANTHROPIC_API_KEY": "sk-ant-...",
+    "DB_PASSWORD": "...",
+    "SLACK_WEBHOOK_URL": "https://hooks.slack.com/...",
+    "GITHUB_TOKEN": "ghp_...",
+    "LANGFUSE_SECRET_KEY": "sk-lf-..."
+  }'
+```
+
+Reference these in your ECS Task Definition as `valueFrom` secrets — never hardcode them as `environment` variables.
+
+#### 4. ECS Task Definitions
+
+Create a task definition per service. Key fields:
+
+```json
+{
+  "family": "crystal-ms-gateway",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
+  "cpu": "256",
+  "memory": "512",
+  "containerDefinitions": [{
+    "name": "ms-gateway",
+    "image": "<account-id>.dkr.ecr.ap-south-1.amazonaws.com/crystal/ms-gateway:latest",
+    "portMappings": [{ "containerPort": 8080 }],
+    "environment": [
+      { "name": "MS_INTAKE_URL", "value": "http://ms-intake.crystal.local:8081" },
+      { "name": "MS_RESULTS_URL", "value": "http://ms-results.crystal.local:8082" },
+      { "name": "MS_ALERT_URL", "value": "http://ms-alert.crystal.local:8083" }
+    ],
+    "secrets": [
+      { "name": "API_KEY", "valueFrom": "arn:aws:secretsmanager:...:crystal/production:API_KEY::" }
+    ],
+    "logConfiguration": {
+      "logDriver": "awslogs",
+      "options": {
+        "awslogs-group": "/crystal/ms-gateway",
+        "awslogs-region": "ap-south-1",
+        "awslogs-stream-prefix": "ecs"
+      }
+    }
+  }]
+}
+```
+
+Use **AWS Cloud Map** (Service Discovery) for internal DNS — this gives services hostnames like `ms-intake.crystal.local` that resolve within the VPC.
+
+#### 5. ECS Services with ALB
+
+```bash
+# Create ECS cluster
+aws ecs create-cluster --cluster-name crystal
+
+# Create service (ms-gateway example — this one gets the ALB target group)
+aws ecs create-service \
+  --cluster crystal \
+  --service-name ms-gateway \
+  --task-definition crystal-ms-gateway:1 \
+  --desired-count 2 \
+  --launch-type FARGATE \
+  --network-configuration "awsvpcConfiguration={subnets=[subnet-xxx],securityGroups=[sg-xxx]}" \
+  --load-balancers "targetGroupArn=<alb-tg-arn>,containerName=ms-gateway,containerPort=8080"
+```
+
+Only **ms-gateway** gets an ALB target group. All other services are internal, registered only with Cloud Map.
+
+#### 6. Auto-scaling
+
+```bash
+# Register ms-scanner as scalable (scales on Kafka consumer lag)
+aws application-autoscaling register-scalable-target \
+  --service-namespace ecs \
+  --resource-id service/crystal/ms-scanner \
+  --scalable-dimension ecs:service:DesiredCount \
+  --min-capacity 1 \
+  --max-capacity 10
+```
+
+For the scanner, scale based on the `scan-jobs` consumer lag metric from MSK. For Java services, scale on ALB RequestCount or CPU.
+
+#### 7. Kafka topics on MSK
+
+```bash
+# Connect to MSK (via a bastion or Lambda in the same VPC)
+kafka-topics.sh --bootstrap-server <msk-bootstrap> \
+  --create --topic scan-jobs --partitions 6 --replication-factor 2
+
+kafka-topics.sh --bootstrap-server <msk-bootstrap> \
+  --create --topic scan-results --partitions 6 --replication-factor 2
+```
+
+Use **6 partitions** in production — this allows horizontal scaling up to 6 scanner replicas consuming in parallel from the same consumer group.
+
+### Environment variables per service on AWS
+
+| Service | Key variables |
+|---|---|
+| ms-gateway | `API_KEY`, `MS_INTAKE_URL`, `MS_RESULTS_URL`, `MS_ALERT_URL` |
+| ms-intake | `API_KEY`, `KAFKA_BOOTSTRAP_SERVERS` |
+| ms-scanner | `ANTHROPIC_API_KEY`, `KAFKA_BOOTSTRAP_SERVERS`, `GITHUB_TOKEN`, `GITHUB_REPO`, `LANGFUSE_*` |
+| ms-results | `API_KEY`, `KAFKA_BOOTSTRAP_SERVERS`, `DB_URL`, `DB_USERNAME`, `DB_PASSWORD` |
+| ms-alert | `API_KEY`, `KAFKA_BOOTSTRAP_SERVERS`, `SLACK_WEBHOOK_URL` |
+
+### Cost estimate (dev/staging, ap-south-1)
+
+| Resource | Spec | ~Monthly cost |
+|---|---|---|
+| ECS Fargate | 5 services × 0.25 vCPU / 0.5 GB | ~$25 |
+| MSK | 2 × kafka.t3.small | ~$90 |
+| RDS PostgreSQL | db.t3.micro, 20 GB | ~$15 |
+| ALB | 1 ALB | ~$20 |
+| ECR | 5 repos, ~500 MB images | ~$2 |
+| CloudWatch Logs | ~5 GB/month | ~$3 |
+| **Total** | | **~$155/month** |
+
+MSK is the biggest cost driver. For a dev environment, replace MSK with a self-managed Kafka container on a small EC2 instance (t3.small, ~$15/month) to cut costs significantly.
 
 ---
 
-## Project Structure
+## Repo Structure
 
 ```
-crystal/
-├── main.py                  # Entry point
-├── requirements.txt         # Python dependencies
-├── config.py                # Reserved for future configuration
-├── my_database.db           # SQLite output (created on first run)
+project-crystal/
+├── docker-compose.yml       # Full stack — one command to run everything
+├── README.md                # This document
 │
-├── core/
-│   ├── parser.py            # AST-based Python file parser
-│   ├── models.py            # Pydantic data models
-│   └── prompt.py            # Claude system prompt
-│
-├── agents/
-│   └── reviewer.py          # Claude review agent
-│
-├── db/
-│   └── database.py          # SQLite initialization and CRUD
-│
-└── tools/
-    └── schema_tool.py       # report_issues tool definition for Claude
+├── client/                  # React 18 + Vite — web UI
+├── ms-gateway/              # Spring Cloud Gateway — public entry point
+├── ms-intake/               # Spring Boot — scan request intake
+├── ms-scanner/              # Python 3.11 — Claude AI scanner
+├── ms-results/              # Spring Boot — results persistence + query API
+└── ms-alert/                # Spring Boot — Slack alerting
 ```
 
----
-
-## Limitations
-
-- Crystal currently supports Python source files only. Other languages are not parsed.
-- Analysis quality depends on the Claude model's understanding of the codebase context. Large files with many functions may produce less precise line number references.
-- The database schema does not enforce foreign key constraints by default in SQLite; 
-- Crystal does not deduplicate issues across runs. Re-running against the same directory will insert duplicate rows.
+Each folder has its own `README.md`, `Dockerfile`, and all source code. All traffic flows through ms-gateway — downstream services are internal only.

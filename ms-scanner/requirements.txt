@@ -7,3 +7,4 @@ PyGithub
 kafka-python
 gitpython
 opentelemetry-instrumentation-anthropic
+psycopg2-binary
