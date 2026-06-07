@@ -50,9 +50,10 @@ services:
     entrypoint: ["/bin/sh", "-c"]
     command: |
       "
-      kafka-topics --bootstrap-server kafka:29092 --create --if-not-exists --topic scan-jobs --replication-factor 1 --partitions 3
-      kafka-topics --bootstrap-server kafka:29092 --create --if-not-exists --topic scan-results --replication-factor 1 --partitions 3
-      echo 'Kafka topics created.'
+      kafka-topics --bootstrap-server kafka:29092 --create --if-not-exists --topic scan-jobs        --replication-factor 1 --partitions 3
+      kafka-topics --bootstrap-server kafka:29092 --create --if-not-exists --topic scan-results     --replication-factor 1 --partitions 3
+      kafka-topics --bootstrap-server kafka:29092 --create --if-not-exists --topic scan-jobs.DLT   --replication-factor 1 --partitions 1
+      echo 'Kafka topics created: scan-jobs, scan-results, scan-jobs.DLT'
       "
 
   postgres:
@@ -72,7 +73,7 @@ services:
       timeout: 5s
       retries: 5
 
-  # ─── Python Scanner (MS-1) ───────────────────────────────────────────────
+  # ─── Python Scanner ───────────────────────────────────────────────────────
 
   ms-scanner:
     build:
@@ -88,6 +89,7 @@ services:
       KAFKA_BOOTSTRAP_SERVERS: kafka:29092
       KAFKA_TOPIC_SCAN_JOBS: scan-jobs
       KAFKA_TOPIC_SCAN_RESULTS: scan-results
+      KAFKA_TOPIC_SCAN_JOBS_DLT: scan-jobs.DLT
       KAFKA_CONSUMER_GROUP: ms-scanner-group
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
       LANGFUSE_PUBLIC_KEY: ${LANGFUSE_PUBLIC_KEY:-}
@@ -95,10 +97,41 @@ services:
       LANGFUSE_HOST: ${LANGFUSE_HOST:-https://cloud.langfuse.com}
       GITHUB_TOKEN: ${GITHUB_TOKEN:-}
       GITHUB_REPO: ${GITHUB_REPO:-}
+      # SQLite stored on named volume — survives container restarts
+      DB_PATH: /app/data/scanner.db
     volumes:
       - scanner_db:/app/data
 
   # ─── Microservices ────────────────────────────────────────────────────────
+
+  ms-gateway:
+    build:
+      context: ./ms-gateway
+      dockerfile: Dockerfile
+    container_name: crystal-ms-gateway
+    depends_on:
+      ms-intake:
+        condition: service_healthy
+      ms-results:
+        condition: service_healthy
+      ms-alert:
+        condition: service_healthy
+    ports:
+      - "8080:8080"
+    environment:
+      SERVER_PORT: 8080
+      API_KEY: ${API_KEY:-dev-secret-key}
+      MS_INTAKE_URL: http://ms-intake:8081
+      MS_RESULTS_URL: http://ms-results:8082
+      MS_ALERT_URL: http://ms-alert:8083
+      CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-http://localhost:5173,http://localhost:3000}
+      RATE_LIMIT_RPS: ${RATE_LIMIT_RPS:-20}
+      RATE_LIMIT_BURST: ${RATE_LIMIT_BURST:-40}
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/actuator/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
 
   ms-intake:
     build:
@@ -172,6 +205,22 @@ services:
       interval: 30s
       timeout: 10s
       retries: 5
+
+  # ─── Web Client ───────────────────────────────────────────────────────────
+
+  client:
+    build:
+      context: ./client
+      dockerfile: Dockerfile
+    container_name: crystal-client
+    depends_on:
+      ms-gateway:
+        condition: service_healthy
+    ports:
+      - "3000:80"
+    environment:
+      VITE_GATEWAY_URL: http://localhost:8080
+      VITE_API_KEY: ${API_KEY:-dev-secret-key}
 
 volumes:
   postgres_data:

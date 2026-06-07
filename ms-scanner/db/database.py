@@ -1,11 +1,16 @@
+import os
 import sqlite3
 import json
 from core.models import FunctionInfo, FileInfo, IssueInfo
 
+# DB_PATH env var lets Docker mount a named volume so data survives restarts.
+# Falls back to a local file for development.
+_DB_PATH = os.getenv("DB_PATH", "scanner.db")
+
 
 def init_db():
 
-    conn = sqlite3.connect("my_database.db")
+    conn = sqlite3.connect(_DB_PATH)
     cursor = conn.cursor()
 
     cursor.execute("""
@@ -54,7 +59,7 @@ def init_db():
 
 
 def save_file(file_info):
-    conn = sqlite3.connect("my_database.db")
+    conn = sqlite3.connect(_DB_PATH)
     cursor = conn.cursor()
     try:
         cursor.execute(
@@ -88,7 +93,7 @@ def save_file(file_info):
 
 
 def save_issue(issue_info):
-    conn = sqlite3.connect("my_database.db")
+    conn = sqlite3.connect(_DB_PATH)
     cursor = conn.cursor()
     try:
         cursor.execute(

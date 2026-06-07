@@ -94,6 +94,7 @@ def run_service() -> None:
             except Exception as exc:
                 logger.exception("Job %s failed: %s", job_id, exc)
                 producer.publish(job_id, "failure", [])
+                producer.publish_dlt(job, exc)
 
     finally:
         consumer.close()
