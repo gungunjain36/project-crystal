@@ -16,12 +16,15 @@ Crystal is a cloud-native static security analysis platform. It scans source cod
 - [Known Gaps & Next Steps](#known-gaps--next-steps)
 - [Running Locally](#running-locally)
 - [Deploying to AWS](#deploying-to-aws)
+- [Repo Structure](#repo-structure)
 
 ---
 
 ## How We Built This
 
 Crystal started as a single Python script: walk a directory, parse Python files with AST, send each file to Claude for security review, write findings to SQLite. That was MS-1 — simple, useful, but not scalable and not usable by external clients.
+
+The platform has since grown into a full product: a web client where users configure GitHub repositories and trigger scans, backed by an event-driven microservices pipeline.
 
 **The problem with the single-service model:**
 - Scanning is slow (LLM calls per file). A synchronous REST API would time out.
@@ -45,21 +48,31 @@ We decomposed the pipeline into four services with clear contracts, connected by
 ## System Architecture
 
 ```
-                         ┌─────────────────────────────┐
-                         │        ms-gateway :8080      │
-                         │    Spring Cloud Gateway      │
-                         │  - API key validation        │
-                         │  - Rate limiting (IP-based)  │
-                         │  - CORS                      │
-                         │  - Route to downstream       │
-                         └────────────┬────────────────┘
-                                      │
-               ┌──────────────────────┼──────────────────────┐
-               │                      │                       │
-               ▼                      ▼                       ▼
-      /api/v1/scans/**     /api/v1/results/**      /api/v1/alerts/**
-               │
-               ▼
+    ┌──────────────────────────────────┐
+    │        client :3000              │
+    │   React 18 + Vite + Tailwind     │
+    │  - Configure GitHub repos        │
+    │  - Trigger scans one-click       │
+    │  - Live polling for results      │
+    │  - Severity breakdown UI         │
+    └────────────────┬─────────────────┘
+                     │  HTTP (all API calls)
+                     ▼
+    ┌──────────────────────────────────┐
+    │        ms-gateway :8080          │
+    │     Spring Cloud Gateway         │
+    │  - X-API-Key validation          │
+    │  - Rate limiting 20 req/s per IP │
+    │  - CORS                          │
+    │  - /health/services aggregation  │
+    └────────────────┬─────────────────┘
+                     │
+      ┌──────────────┼──────────────────┐
+      │              │                  │
+      ▼              ▼                  ▼
+ /api/v1/scans  /api/v1/results  /api/v1/alerts
+      │
+      ▼
     ┌─────────────────────┐
     │   ms-intake :8081   │
     │   Spring Boot REST  │
@@ -75,22 +88,20 @@ We decomposed the pipeline into four services with clear contracts, connected by
     │  Claude AI review   │
     │  GitHub issues      │
     │  Langfuse traces    │
-    └────────┬────────────┘
-             │  Kafka: scan-results
-             ├──────────────────────────────┐
-             ▼                              ▼
-    ┌─────────────────────┐       ┌──────────────────────┐
-    │  ms-results :8082   │       │   ms-alert :8083     │
-    │  Spring Boot        │       │   Spring Boot        │
-    │  Persists to        │       │   Slack webhook for  │
-    │  PostgreSQL         │       │   high/critical only │
-    │  REST query API     │       └──────────────────────┘
-    └─────────────────────┘
+    └────┬────────────┬───┘
+         │            │
+         │  scan-results   scan-jobs.DLT (on failure)
+         ▼            ▼
+    ┌────────────┐  ┌───────────────────┐
+    │ ms-results │  │    ms-alert       │
+    │ :8082      │  │    :8083          │
+    │ PostgreSQL │  │ Slack webhook     │
+    │ REST API   │  │ high/critical only│
+    └────────────┘  └───────────────────┘
 
 Infrastructure:
-  Kafka + Zookeeper    — async message transport
-  PostgreSQL           — persistent results store (ms-results)
-  SQLite               — scanner-local file/function metadata (ms-scanner)
+  Kafka + Zookeeper  — async message transport (3 topics)
+  PostgreSQL         — shared DB for ms-results + ms-scanner internal tables
 ```
 
 ---
@@ -99,7 +110,8 @@ Infrastructure:
 
 | Service | Stack | Port | Responsibility |
 |---|---|---|---|
-| [ms-gateway](./ms-gateway/README.md) | Spring Cloud Gateway | 8080 | Single public entry point. Auth, rate limiting, routing. |
+| [client](./client/README.md) | React 18 + Vite + Tailwind | 3000 | Web UI — configure repos, trigger scans, view results with live polling. |
+| [ms-gateway](./ms-gateway/README.md) | Spring Cloud Gateway | 8080 | Single public entry point. Auth, rate limiting, CORS, health aggregation. |
 | [ms-intake](./ms-intake/README.md) | Spring Boot 3.5 | 8081 | Accepts scan requests, validates, produces to `scan-jobs`. |
 | [ms-scanner](./ms-scanner/README.md) | Python 3.11 | — | Consumes `scan-jobs`, runs Claude analysis, produces to `scan-results`. |
 | [ms-results](./ms-results/README.md) | Spring Boot 3.5 | 8082 | Consumes `scan-results`, persists to PostgreSQL, REST query API. |
@@ -223,15 +235,18 @@ For local development and self-hosted deployments, a code-managed gateway is sim
 
 These are real production gaps to address before a serious deployment:
 
-| Gap | Impact | Fix |
+| Gap | Status | Notes |
 |---|---|---|
-| No dead-letter topic | Failed scan messages are lost on scanner crash | Add `scan-jobs.DLT` topic + retry logic in ms-scanner |
-| ms-scanner SQLite not persistent in containers | Audit log lost on container restart | Mount EFS volume (AWS) or switch to shared PostgreSQL |
-| Static API key auth | No per-client rate limiting or revocation | Upgrade to JWT validated at gateway |
-| No circuit breaker | Gateway retries to a crashed service → cascading failure | Add Resilience4j circuit breaker to gateway routes |
-| ms-scanner not horizontally scalable | Single scanner = bottleneck for high job volume | Kafka consumer group already configured — just run multiple replicas |
-| No job status endpoint | Client can't distinguish "scanning" from "failed" | Add job status table to ms-results, ms-scanner publishes `status: scanning` on pickup |
-| Slack-only alerting | | Add ms-alert webhook fanout (PagerDuty, email, Teams) |
+| No dead-letter topic | **Fixed** | `scan-jobs.DLT` topic created; scanner publishes failed jobs there with full stack trace |
+| ms-scanner SQLite not persistent | **Fixed** | Migrated to PostgreSQL (`scanner_files`, `scanner_functions`, `scanner_issues` tables in shared DB) |
+| No rate limiting | **Fixed** | ms-gateway: Guava RateLimiter per IP, 20 req/s with burst 40, returns 429 |
+| No API gateway | **Fixed** | ms-gateway (Spring Cloud Gateway) on :8080 — auth, rate limiting, CORS, health aggregation |
+| No web client | **Fixed** | React client on :3000 — repo management, one-click scans, live result polling |
+| Static API key auth | **Remaining** | Upgrade path: JWT (RS256) validated at gateway → Cognito/Keycloak for full OAuth |
+| No circuit breaker | **Remaining** | Add Resilience4j circuit breaker to ms-gateway routes — prevents cascade failures |
+| ms-scanner not horizontally scalable | **Partial** | Consumer group configured, but Kafka partition count (3) limits parallelism — increase for production |
+| No job status endpoint | **Remaining** | Client polls `GET /results/{jobId}` which returns 404 until scan completes — add a `status: pending/scanning` intermediate state |
+| Slack-only alerting | **Remaining** | ms-alert webhook fanout (PagerDuty, email, Teams) can be added as strategy pattern |
 
 ---
 
@@ -276,7 +291,12 @@ DB_PASSWORD=crystal
 docker-compose up --build
 ```
 
-### Triggering a scan
+3. Open the web client at **http://localhost:3000**
+   - Add a GitHub repo URL in the dashboard
+   - Click "Run Scan" — the job is submitted through the gateway
+   - Results appear automatically as the scanner finishes (live polling)
+
+### Triggering a scan via API
 
 ```bash
 # Scan a GitHub repository
@@ -532,12 +552,15 @@ MSK is the biggest cost driver. For a dev environment, replace MSK with a self-m
 
 ```
 project-crystal/
-├── docker-compose.yml       # Full local stack
+├── docker-compose.yml       # Full stack — one command to run everything
 ├── README.md                # This document
 │
+├── client/                  # React 18 + Vite — web UI
 ├── ms-gateway/              # Spring Cloud Gateway — public entry point
 ├── ms-intake/               # Spring Boot — scan request intake
 ├── ms-scanner/              # Python 3.11 — Claude AI scanner
-├── ms-results/              # Spring Boot — results storage + query API
+├── ms-results/              # Spring Boot — results persistence + query API
 └── ms-alert/                # Spring Boot — Slack alerting
 ```
+
+Each folder has its own `README.md`, `Dockerfile`, and all source code. All traffic flows through ms-gateway — downstream services are internal only.
