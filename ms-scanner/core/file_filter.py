@@ -26,8 +26,15 @@ _SKIP_FILENAME_PATTERNS = (
     "setup.cfg",
 )
 
-# Extensions we can analyse (extend as parsers are added)
-_SCANNABLE_EXTENSIONS = {".py", ".js", ".ts", ".jsx", ".tsx", ".java", ".go"}
+# Extensions we can analyse — keep in sync with language_router._build_parsers()
+_SCANNABLE_EXTENSIONS = {
+    ".py",                          # Python (AST)
+    ".js", ".mjs", ".cjs", ".jsx",  # JavaScript (tree-sitter)
+    ".ts", ".tsx",                  # TypeScript (tree-sitter)
+    ".java",                        # Java (tree-sitter)
+    ".go",                          # Go (tree-sitter)
+    ".rb",                          # Ruby (tree-sitter)
+}
 
 
 def should_scan(path: Path) -> bool:

@@ -7,15 +7,23 @@ from tools.schema_tool import tools
 
 logger = logging.getLogger(__name__)
 
-# Files larger than this are truncated before sending to avoid burning context
-MAX_CODE_CHARS = 80_000  # ~20K tokens
-
+MAX_CODE_CHARS = 80_000
 _RETRY_EXCEPTIONS = (APIError, APITimeoutError, RateLimitError)
 _MAX_RETRIES = 3
-_RETRY_BACKOFF = [2, 5, 15]  # seconds between retries
+_RETRY_BACKOFF = [2, 5, 15]
+
+# The system prompt is large and static — cache it across all file reviews
+# in the same scan job (Anthropic ephemeral cache TTL = 5 minutes).
+_CACHED_SYSTEM = [
+    {
+        "type": "text",
+        "text": SYSTEM_PROMPT,
+        "cache_control": {"type": "ephemeral"},
+    }
+]
 
 
-def _build_user_prompt(file_info: FileInfo) -> str:
+def _build_user_prompt(file_info: FileInfo, call_graph_context: str = "") -> str:
     function_details = []
     for f in file_info.functions:
         detail = (
@@ -36,8 +44,12 @@ def _build_user_prompt(file_info: FileInfo) -> str:
         code = code[:MAX_CODE_CHARS]
         truncated = True
 
-    return f"""Perform a thorough security analysis of this file.
+    context_section = ""
+    if call_graph_context:
+        context_section = f"\n=== CALL GRAPH CONTEXT ===\n{call_graph_context}\n"
 
+    return f"""Perform a thorough security analysis of this file.
+{context_section}
 === FILE METADATA ===
 Path:         {file_info.filepath}
 Total lines:  {file_info.total_lines}{'  [TRUNCATED to first ~80K chars]' if truncated else ''}
@@ -52,9 +64,13 @@ Classes:      {file_info.classes}
 """
 
 
-def review_file(file_info: FileInfo, file_id: int) -> list[IssueInfo]:
+def review_file(
+    file_info: FileInfo,
+    file_id: int,
+    call_graph_context: str = "",
+) -> list[IssueInfo]:
     client = Anthropic()
-    user_message = _build_user_prompt(file_info)
+    user_message = _build_user_prompt(file_info, call_graph_context)
 
     response = None
     for attempt in range(_MAX_RETRIES):
@@ -62,7 +78,7 @@ def review_file(file_info: FileInfo, file_id: int) -> list[IssueInfo]:
             response = client.messages.create(
                 model="claude-sonnet-4-6",
                 max_tokens=8192,
-                system=SYSTEM_PROMPT,
+                system=_CACHED_SYSTEM,
                 messages=[{"role": "user", "content": user_message}],
                 tools=tools,
                 tool_choice={"type": "tool", "name": "report_issues"},
@@ -70,10 +86,16 @@ def review_file(file_info: FileInfo, file_id: int) -> list[IssueInfo]:
             break
         except _RETRY_EXCEPTIONS as exc:
             if attempt == _MAX_RETRIES - 1:
-                logger.error("Claude API failed after %d retries for %s: %s", _MAX_RETRIES, file_info.filepath, exc)
+                logger.error(
+                    "Claude API failed after %d retries for %s: %s",
+                    _MAX_RETRIES, file_info.filepath, exc,
+                )
                 return []
             wait = _RETRY_BACKOFF[attempt]
-            logger.warning("Claude API error (%s), retrying in %ds [attempt %d/%d]", exc, wait, attempt + 1, _MAX_RETRIES)
+            logger.warning(
+                "Claude API error (%s), retrying in %ds [attempt %d/%d]",
+                exc, wait, attempt + 1, _MAX_RETRIES,
+            )
             time.sleep(wait)
 
     if response is None:
@@ -113,6 +135,18 @@ def review_file(file_info: FileInfo, file_id: int) -> list[IssueInfo]:
             status="open",
             source="claude",
         ))
+
+    # Log cache performance on the first call to give visibility into savings
+    usage = getattr(response, "usage", None)
+    if usage:
+        cache_read = getattr(usage, "cache_read_input_tokens", 0)
+        cache_created = getattr(usage, "cache_creation_input_tokens", 0)
+        if cache_read or cache_created:
+            logger.debug(
+                "Token usage for %s — cache_read=%d cache_created=%d input=%d output=%d",
+                file_info.filepath, cache_read, cache_created,
+                usage.input_tokens, usage.output_tokens,
+            )
 
     logger.info("Claude found %d issue(s) in %s", len(issues), file_info.filepath)
     return issues
