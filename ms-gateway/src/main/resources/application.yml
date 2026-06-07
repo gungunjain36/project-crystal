@@ -1,0 +1,72 @@
+server:
+  port: ${SERVER_PORT:8080}
+
+spring:
+  application:
+    name: ms-gateway
+  cloud:
+    gateway:
+      globalcors:
+        cors-configurations:
+          '[/**]':
+            allowedOrigins: ${CORS_ALLOWED_ORIGINS:http://localhost:3000}
+            allowedMethods: ["GET","POST","PUT","DELETE","OPTIONS","PATCH"]
+            allowedHeaders: ["*"]
+            allowCredentials: false
+      default-filters:
+        - DedupeResponseHeader=Access-Control-Allow-Credentials Access-Control-Allow-Origin
+      routes:
+        - id: ms-intake
+          uri: ${MS_INTAKE_URL:http://ms-intake:8081}
+          predicates:
+            - Path=/api/v1/scans/**
+          filters:
+            - RemoveRequestHeader=X-Internal-Request
+            - AddRequestHeader=X-Gateway-Source, ms-gateway
+
+        - id: ms-results
+          uri: ${MS_RESULTS_URL:http://ms-results:8082}
+          predicates:
+            - Path=/api/v1/results/**
+          filters:
+            - RemoveRequestHeader=X-Internal-Request
+            - AddRequestHeader=X-Gateway-Source, ms-gateway
+
+        - id: ms-alert
+          uri: ${MS_ALERT_URL:http://ms-alert:8083}
+          predicates:
+            - Path=/api/v1/alerts/**
+          filters:
+            - RemoveRequestHeader=X-Internal-Request
+            - AddRequestHeader=X-Gateway-Source, ms-gateway
+
+# API key for X-API-Key header validation
+app:
+  api-key: ${API_KEY:dev-secret-key}
+
+# Downstream service URLs (also used by HealthAggregatorController)
+downstream:
+  ms-intake:
+    url: ${MS_INTAKE_URL:http://ms-intake:8081}
+  ms-results:
+    url: ${MS_RESULTS_URL:http://ms-results:8082}
+  ms-alert:
+    url: ${MS_ALERT_URL:http://ms-alert:8083}
+
+# Actuator
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics,gateway
+  endpoint:
+    health:
+      show-details: always
+  health:
+    defaults:
+      enabled: true
+
+logging:
+  level:
+    org.springframework.cloud.gateway: INFO
+    com.crystal.msgateway: DEBUG
