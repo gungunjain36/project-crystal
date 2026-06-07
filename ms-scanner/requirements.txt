@@ -1,0 +1,9 @@
+langfuse
+anthropic
+python-dotenv
+rich
+pydantic
+PyGithub
+kafka-python
+gitpython
+opentelemetry-instrumentation-anthropic
