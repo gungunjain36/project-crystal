@@ -1,0 +1,33 @@
+server:
+  port: ${SERVER_PORT:8083}
+
+spring:
+  application:
+    name: ms-alert
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
+    consumer:
+      group-id: ${KAFKA_CONSUMER_GROUP:ms-alert-group}
+      auto-offset-reset: earliest
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.springframework.kafka.support.serializer.JsonDeserializer
+      properties:
+        spring.json.trusted.packages: "com.crystal.msalert.model.dto"
+        spring.json.value.default.type: com.crystal.msalert.model.dto.ScanResultMessage
+
+kafka:
+  topics:
+    scan-results: ${KAFKA_TOPIC_SCAN_RESULTS:scan-results}
+
+app:
+  slack:
+    webhook-url: ${SLACK_WEBHOOK_URL:}
+    enabled: ${SLACK_ALERTS_ENABLED:true}
+  alert:
+    severities: ${ALERT_SEVERITIES:high,critical}
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics
